@@ -74,6 +74,8 @@ AC_MODE_TO_STATE = {
     "fanOnly": HVACMode.FAN_ONLY,
     "fan": HVACMode.FAN_ONLY,
     "wind": HVACMode.FAN_ONLY,
+    # Samsung AI Comfort mode - treat as AUTO since it automatically adjusts
+    "aIComfort": HVACMode.AUTO,
 }
 STATE_TO_AC_MODE = {
     HVACMode.AUTO: "auto",
@@ -81,6 +83,14 @@ STATE_TO_AC_MODE = {
     HVACMode.DRY: "dry",
     HVACMode.HEAT: "heat",
     HVACMode.FAN_ONLY: "fanOnly",
+}
+
+# Track Samsung-specific modes for better handling
+SAMSUNG_SPECIAL_MODES = {
+    "aIComfort": "AI Comfort",
+    "coolClean": "Cool Clean",
+    "dryClean": "Dry Clean",
+    "heatClean": "Heat Clean",
 }
 
 SWING_TO_FAN_OSCILLATION = {
@@ -122,12 +132,17 @@ FAN = "fan"
 _LOGGER = logging.getLogger(__name__)
 
 
-AC_CAPABILITIES = [
+# Required capabilities for AC devices
+AC_CAPABILITIES_REQUIRED = [
     Capability.AIR_CONDITIONER_MODE,
-    Capability.AIR_CONDITIONER_FAN_MODE,
     Capability.SWITCH,
     Capability.TEMPERATURE_MEASUREMENT,
     Capability.THERMOSTAT_COOLING_SETPOINT,
+]
+
+# Optional capabilities that AC devices may have
+AC_CAPABILITIES_OPTIONAL = [
+    Capability.AIR_CONDITIONER_FAN_MODE,
 ]
 
 THERMOSTAT_CAPABILITIES = [
@@ -152,11 +167,25 @@ async def async_setup_entry(
 ) -> None:
     """Add climate entities for a config entry."""
     entry_data = entry.runtime_data
+
+    # Create AC entities - check for required capabilities only
+    # Optional capabilities like FAN_MODE are handled in the entity class
     entities: list[ClimateEntity] = [
         SmartThingsAirConditioner(entry_data.client, device)
         for device in entry_data.devices.values()
-        if all(capability in device.status[MAIN] for capability in AC_CAPABILITIES)
+        if MAIN in device.status
+        and all(capability in device.status[MAIN] for capability in AC_CAPABILITIES_REQUIRED)
     ]
+
+    # Log AC device detection
+    if entities:
+        _LOGGER.debug(
+            "Created %d AC climate entities for devices: %s",
+            len(entities),
+            [getattr(e.device.device, 'label', 'Unknown') for e in entities]
+        )
+
+    # Create thermostat entities
     entities.extend(
         SmartThingsThermostat(entry_data.client, device)
         for device in entry_data.devices.values()
@@ -164,6 +193,8 @@ async def async_setup_entry(
             capability in device.status[MAIN] for capability in THERMOSTAT_CAPABILITIES
         )
     )
+
+    # Create heat pump zone entities
     entities.extend(
         SmartThingsHeatPumpZone(entry_data.client, device, component)
         for device in entry_data.devices.values()
@@ -174,6 +205,7 @@ async def async_setup_entry(
             for capability in HEAT_PUMP_CAPABILITIES
         )
     )
+
     async_add_entities(entities)
 
 
@@ -405,10 +437,12 @@ class SmartThingsAirConditioner(SmartThingsEntity, ClimateEntity):
     def _determine_supported_features(self) -> ClimateEntityFeature:
         features = (
             ClimateEntityFeature.TARGET_TEMPERATURE
-            | ClimateEntityFeature.FAN_MODE
             | ClimateEntityFeature.TURN_OFF
             | ClimateEntityFeature.TURN_ON
         )
+        # Only add FAN_MODE feature if the capability is actually present
+        if self.supports_capability(Capability.AIR_CONDITIONER_FAN_MODE):
+            features |= ClimateEntityFeature.FAN_MODE
         if self.supports_capability(Capability.FAN_OSCILLATION_MODE):
             features |= ClimateEntityFeature.SWING_MODE
         if (self._attr_preset_modes is not None) and len(self._attr_preset_modes) > 0:
@@ -417,6 +451,9 @@ class SmartThingsAirConditioner(SmartThingsEntity, ClimateEntity):
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set new target fan mode."""
+        if not self.supports_capability(Capability.AIR_CONDITIONER_FAN_MODE):
+            _LOGGER.warning("Device %s does not support fan mode control", self.device.device.label)
+            return
         await self.execute_device_command(
             Capability.AIR_CONDITIONER_FAN_MODE,
             Command.SET_FAN_MODE,
@@ -433,16 +470,28 @@ class SmartThingsAirConditioner(SmartThingsEntity, ClimateEntity):
         if self.get_attribute_value(Capability.SWITCH, Attribute.SWITCH) == "off":
             tasks.append(self.async_turn_on())
 
+        # Get supported modes for this device
+        supported_ac_modes = self.get_attribute_value(
+            Capability.AIR_CONDITIONER_MODE, Attribute.SUPPORTED_AC_MODES
+        )
+
         mode = STATE_TO_AC_MODE[hvac_mode]
-        # If new hvac_mode is HVAC_MODE_FAN_ONLY and AirConditioner support "wind" or "fan" mode the AirConditioner
-        # new mode has to be "wind" or "fan"
+
+        # Special handling for different mode types
         if hvac_mode == HVACMode.FAN_ONLY:
+            # Prefer "wind" or "fan" for fan-only mode if available
             for fan_mode in (WIND, FAN):
-                if fan_mode in self.get_attribute_value(
-                    Capability.AIR_CONDITIONER_MODE, Attribute.SUPPORTED_AC_MODES
-                ):
+                if fan_mode in supported_ac_modes:
                     mode = fan_mode
                     break
+        elif hvac_mode == HVACMode.AUTO:
+            # Check if device supports AI Comfort mode and prefer it for AUTO
+            if "aIComfort" in supported_ac_modes:
+                mode = "aIComfort"
+                _LOGGER.info(
+                    "Using Samsung AI Comfort mode for %s",
+                    self.device.device.label
+                )
 
         tasks.append(
             self.execute_device_command(
@@ -503,34 +552,49 @@ class SmartThingsAirConditioner(SmartThingsEntity, ClimateEntity):
         """Return device specific state attributes.
 
         Include attributes from the Demand Response Load Control (drlc)
-        and Power Consumption capabilities.
+        and Power Consumption capabilities, as well as the actual AC mode.
         """
-        if not self.supports_capability(Capability.DEMAND_RESPONSE_LOAD_CONTROL):
-            return None
-
-        drlc_status = self.get_attribute_value(
-            Capability.DEMAND_RESPONSE_LOAD_CONTROL,
-            Attribute.DEMAND_RESPONSE_LOAD_CONTROL_STATUS,
-        )
         res = {}
-        for key in ("duration", "start", "override", "drlcLevel"):
-            if key in drlc_status:
-                dict_key = {"drlcLevel": "drlc_status_level"}.get(
-                    key, f"drlc_status_{key}"
-                )
-                res[dict_key] = drlc_status[key]
-        return res
+
+        # Add the actual AC mode (e.g., "aIComfort") for better visibility
+        actual_mode = self.get_attribute_value(
+            Capability.AIR_CONDITIONER_MODE, Attribute.AIR_CONDITIONER_MODE
+        )
+        if actual_mode:
+            res["actual_ac_mode"] = actual_mode
+            # Add friendly name for special Samsung modes
+            if actual_mode in SAMSUNG_SPECIAL_MODES:
+                res["mode_description"] = SAMSUNG_SPECIAL_MODES[actual_mode]
+
+        # Include DRLC status if available
+        if self.supports_capability(Capability.DEMAND_RESPONSE_LOAD_CONTROL):
+            drlc_status = self.get_attribute_value(
+                Capability.DEMAND_RESPONSE_LOAD_CONTROL,
+                Attribute.DEMAND_RESPONSE_LOAD_CONTROL_STATUS,
+            )
+            for key in ("duration", "start", "override", "drlcLevel"):
+                if key in drlc_status:
+                    dict_key = {"drlcLevel": "drlc_status_level"}.get(
+                        key, f"drlc_status_{key}"
+                    )
+                    res[dict_key] = drlc_status[key]
+
+        return res if res else None
 
     @property
-    def fan_mode(self) -> str:
+    def fan_mode(self) -> str | None:
         """Return the fan setting."""
+        if not self.supports_capability(Capability.AIR_CONDITIONER_FAN_MODE):
+            return None
         return self.get_attribute_value(
             Capability.AIR_CONDITIONER_FAN_MODE, Attribute.FAN_MODE
         )
 
     @property
-    def fan_modes(self) -> list[str]:
+    def fan_modes(self) -> list[str] | None:
         """Return the list of available fan modes."""
+        if not self.supports_capability(Capability.AIR_CONDITIONER_FAN_MODE):
+            return None
         return self.get_attribute_value(
             Capability.AIR_CONDITIONER_FAN_MODE, Attribute.SUPPORTED_AC_FAN_MODES
         )
@@ -637,12 +701,39 @@ class SmartThingsAirConditioner(SmartThingsEntity, ClimateEntity):
                 Capability.AIR_CONDITIONER_MODE, Attribute.SUPPORTED_AC_MODES
             )
         ) is not None:
-            modes.extend(
-                state
-                for mode in ac_modes
-                if (state := AC_MODE_TO_STATE.get(mode)) is not None
-                if state not in modes
+            # Log all supported modes from the device
+            _LOGGER.debug(
+                "Device %s supports AC modes: %s",
+                self.device.device.label,
+                ac_modes
             )
+
+            # Track unmapped modes for debugging
+            unmapped_modes = []
+
+            for mode in ac_modes:
+                if (state := AC_MODE_TO_STATE.get(mode)) is not None:
+                    if state not in modes:
+                        modes.append(state)
+                    # Log special Samsung modes
+                    if mode in SAMSUNG_SPECIAL_MODES:
+                        _LOGGER.info(
+                            "Device %s supports Samsung special mode: %s (%s)",
+                            self.device.device.label,
+                            mode,
+                            SAMSUNG_SPECIAL_MODES[mode]
+                        )
+                else:
+                    unmapped_modes.append(mode)
+
+            # Report unknown modes for future support
+            if unmapped_modes:
+                _LOGGER.warning(
+                    "Device %s has unmapped AC modes: %s. Please report at https://github.com/home-assistant/core/issues",
+                    self.device.device.label,
+                    unmapped_modes
+                )
+
         return modes
 
 
